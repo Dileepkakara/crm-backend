@@ -19,14 +19,17 @@ import { resourceRouter } from './routes/resourceRoutes.js'
 export function createApp() {
   const env = getEnv()
   const app = express()
-  const origins = env.FRONTEND_URL.split(',').map((origin) => origin.trim()).filter(Boolean)
+  const origins = new Set([
+    ...env.FRONTEND_URL.split(',').map((origin) => origin.trim()).filter(Boolean),
+    'https://crm-frontend-rho-lilac.vercel.app',
+  ])
 
   app.disable('x-powered-by')
   app.use(requestContext)
   app.use(helmet())
   app.use(cors({
     origin(origin, callback) {
-      if (!origin || origins.includes(origin)) return callback(null, true)
+      if (!origin || origins.has(origin)) return callback(null, true)
       callback(new AppError(403, 'CORS_ORIGIN_DENIED', 'This origin is not allowed to access the API.'))
     },
     credentials: true,

@@ -16,6 +16,16 @@ test('reports API health without requiring a live database in test mode', async 
   assert.deepEqual(response.body, { success: true, data: { status: 'ok' } })
 })
 
+test('allows the deployed Vercel frontend to call the API', async () => {
+  const response = await request(app)
+    .post('/api/v1/auth/refresh')
+    .set('Origin', 'https://crm-frontend-rho-lilac.vercel.app')
+
+  assert.equal(response.status, 401)
+  assert.equal(response.headers['access-control-allow-origin'], 'https://crm-frontend-rho-lilac.vercel.app')
+  assert.equal(response.headers['access-control-allow-credentials'], 'true')
+})
+
 test('protects user management and clears the refresh cookie on logout', async () => {
   const [users, logout] = await Promise.all([
     request(app).get('/api/v1/users'),

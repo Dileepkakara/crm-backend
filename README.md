@@ -19,6 +19,12 @@ Node.js, Express, and MongoDB API for the existing React frontend. The API is mo
    Remove-Item Env:SUPER_ADMIN_PASSWORD
    ```
 
+### Production deployment
+
+The production frontend is hosted at `https://crm-frontend-rho-lilac.vercel.app` and uses the CRM API at `https://crm-backend-9lji.onrender.com/api/v1`. Set `VITE_API_BASE_URL` to that API URL in the Vercel project and redeploy after changing it. The backend allows this production frontend origin plus the comma-separated origins configured in `FRONTEND_URL`. If the frontend is moved to a different domain, add its exact origin to `FRONTEND_URL` in the Render backend environment and redeploy the backend.
+
+For Vercel deployments, `frontend/vercel.json` rewrites app routes such as `/login` to `index.html`, so direct navigation and refreshes continue to work with React Router.
+
 ### Configure a local MongoDB replica set on Windows
 
 CRM record creation, updates, audit logging, lead conversion, and payment workflows use MongoDB transactions. A standalone MongoDB server rejects these operations. If MongoDB is installed as a Windows service:
