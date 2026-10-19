@@ -16,14 +16,31 @@ test('reports API health without requiring a live database in test mode', async 
   assert.deepEqual(response.body, { success: true, data: { status: 'ok' } })
 })
 
-test('allows the deployed Vercel frontend to call the API', async () => {
+test('allows the deployed Vercel frontend domains to call the API', async () => {
+  const origins = [
+    'https://crm-frontend-rho-lilac.vercel.app',
+    'https://crm-frontend-git-main-dileeps-projects-efeb0f16.vercel.app',
+    'https://crm-frontend-audztfl0o-dileeps-projects-efeb0f16.vercel.app',
+  ]
+
+  for (const origin of origins) {
+    const response = await request(app)
+      .post('/api/v1/auth/refresh')
+      .set('Origin', origin)
+
+    assert.equal(response.status, 401)
+    assert.equal(response.headers['access-control-allow-origin'], origin)
+    assert.equal(response.headers['access-control-allow-credentials'], 'true')
+  }
+})
+
+test('rejects unconfigured frontend origins', async () => {
   const response = await request(app)
     .post('/api/v1/auth/refresh')
-    .set('Origin', 'https://crm-frontend-rho-lilac.vercel.app')
+    .set('Origin', 'https://untrusted.example')
 
-  assert.equal(response.status, 401)
-  assert.equal(response.headers['access-control-allow-origin'], 'https://crm-frontend-rho-lilac.vercel.app')
-  assert.equal(response.headers['access-control-allow-credentials'], 'true')
+  assert.equal(response.status, 403)
+  assert.equal(response.body.error.code, 'CORS_ORIGIN_DENIED')
 })
 
 test('protects user management and clears the refresh cookie on logout', async () => {
