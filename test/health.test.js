@@ -44,15 +44,24 @@ test('rejects unconfigured frontend origins', async () => {
 })
 
 test('protects user management and clears the refresh cookie on logout', async () => {
-  const [users, logout] = await Promise.all([
-    request(app).get('/api/v1/users'),
-    request(app).post('/api/v1/auth/logout'),
-  ])
+  const users = await request(app).get('/api/v1/users')
 
   assert.equal(users.status, 401)
   assert.equal(users.body.error.code, 'UNAUTHENTICATED')
+
+  const originalNodeEnv = process.env.NODE_ENV
+  process.env.NODE_ENV = 'production'
+  let logout
+  try {
+    logout = await request(app).post('/api/v1/auth/logout')
+  } finally {
+    process.env.NODE_ENV = originalNodeEnv
+  }
+
   assert.equal(logout.status, 200)
   assert.match(logout.headers['set-cookie'][0], /dbcrm_refresh=;/)
+  assert.match(logout.headers['set-cookie'][0], /SameSite=None/i)
+  assert.match(logout.headers['set-cookie'][0], /Secure/i)
 })
 
 test('explains when MongoDB transactions require a replica set', () => {

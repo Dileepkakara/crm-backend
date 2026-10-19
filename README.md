@@ -63,7 +63,7 @@ After seeding, sign in through the frontend login page with the configured Super
 
 ## Authentication and response contract
 
-Login returns a short-lived bearer access token and sets a rotating, HTTP-only refresh cookie. Keep the access token in memory; the frontend refreshes the cookie-backed session after a page reload. Logout and password changes revoke the stored refresh token and invalidate current access tokens. Configure HTTPS in production. Password changes require the current password; there is no password recovery email provider configured.
+Login returns a short-lived bearer access token and sets a rotating, HTTP-only refresh cookie. Keep the access token in memory; the frontend refreshes the cookie-backed session after a page reload. In production, the refresh cookie uses `SameSite=None; Secure` because the Vercel frontend and Render API are on different sites; browsers must allow cross-site cookies for session restoration. Logout and password changes revoke the stored refresh token and invalidate current access tokens. Configure HTTPS in production. Password changes require the current password; there is no password recovery email provider configured.
 
 Successful responses use `{ "success": true, "data": ... }`; errors use `{ "success": false, "error": { "code", "message", "requestId" } }`. List endpoints return the array under `data` and pagination information under `meta`.
 
