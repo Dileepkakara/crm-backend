@@ -14,7 +14,7 @@ export const resourcePermissions = {
   leads: { read: ['leads.view.all', 'leads.view.assigned'], create: ['leads.create'], update: ['leads.update'], delete: ['leads.delete'] },
   followups: { read: ['followups.view'], create: ['followups.create'], update: ['followups.update'], delete: ['followups.delete'] },
   clients: { read: ['clients.view'], create: ['clients.manage'], update: ['clients.manage'], delete: ['clients.manage'] },
-  quotations: { read: ['quotations.view', 'quotations.view.own'], create: ['quotations.create'], update: ['quotations.create'], delete: [] },
+  quotations: { read: ['quotations.view', 'quotations.view.own'], create: ['quotations.create'], update: ['quotations.create'], delete: ['quotations.create'] },
   agreements: { read: ['agreements.view', 'agreements.view.own'], create: ['agreements.approve'], update: ['agreements.approve'], delete: [] },
   invoices: { read: ['invoices.view', 'invoices.view.own'], create: ['invoices.manage'], update: ['invoices.manage'], delete: [] },
   payments: { read: ['payments.view', 'payments.view.own'], create: ['payments.manage'], update: ['payments.manage'], delete: [] },
@@ -544,10 +544,13 @@ export async function updateResource(resource, id, body, req) {
 }
 
 export async function deleteResource(resource, id, req) {
-  if (resource === 'payments' || resource === 'invoices' || resource === 'quotations' || resource === 'agreements') {
+  if (resource === 'payments' || resource === 'invoices' || resource === 'agreements') {
     throw new AppError(409, 'IMMUTABLE_RESOURCE', 'This record cannot be deleted; use its cancellation or reversal workflow.')
   }
   const record = await findScoped(resource, id, req.user)
+  if (resource === 'quotations' && record.status !== 'Draft') {
+    throw new AppError(409, 'QUOTATION_DELETE_RESTRICTED', 'Only draft quotations can be deleted.')
+  }
   await record.deleteOne()
   await recordAudit(req, `${resource}.deleted`, resource, id, {})
   return { id }
