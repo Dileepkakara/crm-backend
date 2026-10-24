@@ -141,6 +141,16 @@ const invoiceFields = {
   bankDetails: optionalText(1000),
 }
 
+const invoiceUpdateSchema = z.object(invoiceFields).partial().superRefine((data, context) => {
+  if (Object.hasOwn(data, 'status')) {
+    context.addIssue({
+      code: 'custom',
+      path: ['status'],
+      message: 'Invoice status must be changed through the invoice issue or payment workflow.',
+    })
+  }
+})
+
 const paymentFields = {
   invoiceId: text(100).min(1),
   clientId: optionalText(100),
@@ -167,7 +177,7 @@ const projectFields = {
   startDate: date.optional(),
   deadline: date.optional(),
   progress: z.coerce.number().int().min(0).max(100).optional(),
-  status: z.enum(['Planning', 'Not Started', 'In Progress', 'On Hold', 'In Review', 'Completed', 'Cancelled']).optional(),
+  status: z.enum(['Planning', 'Not Started', 'In Progress', 'On Hold', 'In Review', 'Completed', 'Closed', 'Cancelled']).optional(),
   milestones: z.array(z.object({
     id: optionalText(100),
     name: text(200).min(1),
@@ -202,12 +212,25 @@ export const resourceSchemas = {
   clients: { create: z.object(clientFields), update: z.object(clientFields).partial() },
   quotations: { create: z.object(commercialFields), update: z.object(commercialFields).partial() },
   agreements: { create: z.object(agreementFields), update: z.object(agreementFields).partial() },
-  invoices: { create: z.object(invoiceFields), update: z.object(invoiceFields).partial() },
+  invoices: { create: z.object(invoiceFields), update: invoiceUpdateSchema },
   payments: { create: z.object(paymentFields), update: z.object(paymentFields).partial() },
   projects: { create: z.object(projectFields), update: z.object(projectFields).partial() },
   tasks: { create: z.object(taskFields), update: z.object(taskFields).partial() },
   notifications: { create: z.object({ title: text(200).min(1), body: optionalText(2000), category: optionalText(80) }), update: z.object(notificationFields) },
 }
+
+export const invoiceDecisionSchema = z.object({
+  decision: z.enum(['Accepted', 'Rejected']),
+  reason: optionalText(1000),
+}).superRefine((data, context) => {
+  if (data.decision === 'Rejected' && !data.reason?.trim()) {
+    context.addIssue({
+      code: 'custom',
+      path: ['reason'],
+      message: 'A reason is required when rejecting an invoice.',
+    })
+  }
+})
 
 export const authSchemas = {
   login: z.object({ email, password: z.string().min(1).max(200) }),
@@ -215,6 +238,19 @@ export const authSchemas = {
     currentPassword: z.string().min(1).max(200),
     newPassword: z.string().min(12).max(200),
   }),
+}
+
+export const clientSignupSchemas = {
+  submit: z.object({
+    name: text(120).min(1),
+    company: text(160).min(1),
+    email,
+    phone: text(40).min(1),
+    address: optionalText(1000),
+  }),
+  list: z.object({ status: z.enum(['Pending', 'Approved', 'Rejected', 'All']).optional() }),
+  approve: z.object({ existingClientId: optionalText(100) }).optional().default({}),
+  reject: z.object({ reason: optionalText(1000) }).optional().default({}),
 }
 
 export const userSchemas = {

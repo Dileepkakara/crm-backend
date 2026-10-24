@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import request from 'supertest'
+import { createApp } from '../src/app.js'
 import { errorHandler } from '../src/middleware/errorHandler.js'
 
 process.env.NODE_ENV = 'test'
@@ -14,6 +15,18 @@ test('reports API health without requiring a live database in test mode', async 
   const response = await request(app).get('/health')
   assert.equal(response.status, 200)
   assert.deepEqual(response.body, { success: true, data: { status: 'ok' } })
+})
+
+test('disables validators and caching for API responses', async () => {
+  assert.equal(app.get('etag'), false)
+  const response = await request(app)
+    .get('/api/v1/portal')
+    .set('If-None-Match', '*')
+
+  assert.equal(response.status, 401)
+  assert.equal(response.headers.etag, undefined)
+  assert.equal(response.headers['cache-control'], 'no-store, no-cache, must-revalidate, proxy-revalidate')
+  assert.equal(response.headers.pragma, 'no-cache')
 })
 
 test('allows the deployed Vercel frontend domains to call the API', async () => {
@@ -32,6 +45,38 @@ test('allows the deployed Vercel frontend domains to call the API', async () => 
     assert.equal(response.headers['access-control-allow-origin'], origin)
     assert.equal(response.headers['access-control-allow-credentials'], 'true')
   }
+})
+
+test('allows local Vite ports to call the API outside production', async () => {
+  const response = await request(app)
+    .options('/api/v1/auth/login')
+    .set('Origin', 'http://localhost:5174')
+    .set('Access-Control-Request-Method', 'POST')
+    .set('Access-Control-Request-Headers', 'content-type')
+
+  assert.equal(response.status, 204)
+  assert.equal(response.headers['access-control-allow-origin'], 'http://localhost:5174')
+  assert.equal(response.headers['access-control-allow-credentials'], 'true')
+})
+
+test('does not allow arbitrary localhost ports in production CORS', async () => {
+  const originalNodeEnv = process.env.NODE_ENV
+  process.env.NODE_ENV = 'production'
+  let productionApp
+  try {
+    productionApp = createApp()
+  } finally {
+    process.env.NODE_ENV = originalNodeEnv
+  }
+
+  const response = await request(productionApp)
+    .options('/api/v1/auth/login')
+    .set('Origin', 'http://localhost:5174')
+    .set('Access-Control-Request-Method', 'POST')
+    .set('Access-Control-Request-Headers', 'content-type')
+
+  assert.equal(response.status, 403)
+  assert.equal(response.body.error.code, 'CORS_ORIGIN_DENIED')
 })
 
 test('rejects unconfigured frontend origins', async () => {

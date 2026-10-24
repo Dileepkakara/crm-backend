@@ -3,7 +3,7 @@ import bcrypt from 'bcrypt'
 import jwt from 'jsonwebtoken'
 import { getEnv } from '../config/env.js'
 import { AppError } from '../errors/AppError.js'
-import { User } from '../models/index.js'
+import { Client, User } from '../models/index.js'
 import { findActiveRole } from './roles.js'
 
 const REFRESH_COOKIE = 'dbcrm_refresh'
@@ -75,11 +75,20 @@ async function createSession(user, res) {
   return { accessToken: await issueAccessToken(user), user: publicUser(user, role) }
 }
 
-export async function login({ email, password }, res) {
+export async function login({ email, password }, res, expectedRole) {
   const user = await User.findOne({ email: email.toLowerCase() })
     .select('+passwordHash +tokenVersion +refreshTokenHash')
   if (!user || user.status !== 'Active' || !(await bcrypt.compare(password, user.passwordHash))) {
     throw new AppError(401, 'INVALID_CREDENTIALS', 'Email or password is incorrect.')
+  }
+  if (expectedRole && user.role !== expectedRole) {
+    throw new AppError(401, 'INVALID_CREDENTIALS', 'Email or password is incorrect.')
+  }
+  if (expectedRole === 'client') {
+    const linkedClient = user.clientId ? await Client.findOne({ id: user.clientId, status: 'Active' }) : null
+    if (!linkedClient) {
+      throw new AppError(401, 'INVALID_CREDENTIALS', 'Email or password is incorrect.')
+    }
   }
   return createSession(user, res)
 }

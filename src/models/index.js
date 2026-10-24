@@ -12,7 +12,7 @@ const transformDocument = (_doc, ret) => {
   delete ret.idempotencyKey
   delete ret.idempotencyFingerprint
   for (const [key, value] of Object.entries(ret)) {
-    if (value instanceof Date && (key.toLowerCase().includes('date') || key.endsWith('At') || ['since', 'followUp'].includes(key))) {
+    if (value instanceof Date && (key.toLowerCase().includes('date') || ['since', 'followUp'].includes(key))) {
       ret[key] = value.toISOString().slice(0, 10)
     }
   }
@@ -113,6 +113,7 @@ const definitions = {
     revisionReason: { type: String, maxlength: 1000 },
     revisionDate: { type: Date },
     status: { type: String, enum: ['Draft', 'Sent', 'Viewed', 'Accepted', 'Rejected', 'Expired', 'Revised'], default: 'Draft', index: true },
+    invoiceAllocationVersion: { type: Number, default: 0 },
     items: { type: [Schema.Types.Mixed], default: [] },
     lineItems: { type: [Schema.Types.Mixed], default: undefined },
     subtotal: { type: Number, min: 0 },
@@ -139,7 +140,10 @@ const definitions = {
     bankDetails: String,
     sentAt: Date,
     acceptedAt: Date,
+    acceptedBy: String,
     rejectedAt: Date,
+    rejectedBy: String,
+    rejection: Schema.Types.Mixed,
     acceptance: Schema.Types.Mixed,
     acceptedSnapshot: Schema.Types.Mixed,
   },
@@ -159,6 +163,7 @@ const definitions = {
     paymentMilestones: String,
     terms: String,
     status: { type: String, enum: ['Draft', 'Pending approval', 'Accepted', 'Rejected'], default: 'Draft', index: true },
+    invoiceAllocationVersion: { type: Number, default: 0 },
     acceptedAt: Date,
     acceptedBy: String,
     rejectedAt: Date,
@@ -186,6 +191,8 @@ const definitions = {
     project: { type: String, trim: true },
     agreementId: { type: String, index: true },
     quotationId: { type: String, index: true },
+    billingSourceKey: { type: String, unique: true, sparse: true, index: true },
+    sourceSnapshot: Schema.Types.Mixed,
     issueDate: { type: Date, required: true },
     dueDate: { type: Date, required: true, index: true },
     items: { type: [Schema.Types.Mixed], default: [] },
@@ -206,6 +213,12 @@ const definitions = {
     amountPaid: { type: Number, min: 0, default: 0 },
     balance: { type: Number, min: 0, default: 0 },
     status: { type: String, enum: ['Draft', 'Issued', 'Partially Paid', 'Paid', 'Overdue', 'Cancelled'], default: 'Draft', index: true },
+    clientDecision: {
+      status: { type: String, enum: ['Accepted', 'Rejected'] },
+      decidedAt: Date,
+      decidedBy: String,
+      reason: { type: String, trim: true, maxlength: 1000 },
+    },
     billingName: String,
     billingAddress: String,
     customerGstin: String,
@@ -251,10 +264,12 @@ const definitions = {
     startDate: Date,
     deadline: Date,
     progress: { type: Number, min: 0, max: 100, default: 0 },
-    status: { type: String, enum: ['Planning', 'Not Started', 'In Progress', 'On Hold', 'In Review', 'Completed', 'Cancelled'], default: 'Planning', index: true },
+    status: { type: String, enum: ['Planning', 'Not Started', 'In Progress', 'On Hold', 'In Review', 'Completed', 'Closed', 'Cancelled'], default: 'Planning', index: true },
     milestones: { type: [Schema.Types.Mixed], default: [] },
     deliveryRequirements: String,
+    handover: Schema.Types.Mixed,
     closedAt: Date,
+    closedBy: String,
   },
   Task: {
     id: { type: String, unique: true, index: true },
@@ -273,6 +288,7 @@ const definitions = {
   },
   Notification: {
     id: { type: String, unique: true, index: true },
+    dedupeKey: { type: String, unique: true, sparse: true },
     recipientId: { type: String, required: true, index: true },
     title: { type: String, required: true, maxlength: 200 },
     body: { type: String, maxlength: 2000 },
@@ -303,6 +319,29 @@ const definitions = {
 }
 
 export const User = models.User || model('User', userSchema)
+
+const clientSignupRequestSchema = new Schema({
+  id: { type: String, required: true, unique: true, index: true },
+  name: { type: String, required: true, trim: true, maxlength: 120 },
+  company: { type: String, required: true, trim: true, maxlength: 160 },
+  email: { type: String, required: true, lowercase: true, trim: true, maxlength: 254 },
+  normalizedEmail: { type: String, required: true, lowercase: true, trim: true },
+  phone: { type: String, required: true, trim: true, maxlength: 40 },
+  address: { type: String, trim: true, maxlength: 1000 },
+  status: { type: String, enum: ['Pending', 'Approved', 'Rejected'], default: 'Pending', index: true },
+  clientId: { type: String },
+  userId: { type: String },
+  reviewedBy: { type: String },
+  reviewedAt: { type: Date },
+  rejectionReason: { type: String, maxlength: 1000 },
+}, baseOptions)
+clientSignupRequestSchema.index(
+  { normalizedEmail: 1 },
+  { unique: true, partialFilterExpression: { status: 'Pending' } },
+)
+
+export const ClientSignupRequest = models.ClientSignupRequest
+  || model('ClientSignupRequest', clientSignupRequestSchema)
 
 const customRoleSchema = new Schema({
   key: { type: String, required: true, unique: true, trim: true, match: /^custom_[a-z0-9_]+$/ },

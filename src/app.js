@@ -14,11 +14,22 @@ import roleRoutes from './routes/roleRoutes.js'
 import analyticsRoutes from './routes/analyticsRoutes.js'
 import settingsRoutes from './routes/settingsRoutes.js'
 import auditRoutes from './routes/auditRoutes.js'
+import clientSignupRoutes from './routes/clientSignupRoutes.js'
 import { resourceRouter } from './routes/resourceRoutes.js'
 
 export function createApp() {
   const env = getEnv()
   const app = express()
+  const isLocalDevelopmentOrigin = (origin) => {
+    if (env.NODE_ENV === 'production') return false
+    try {
+      const url = new URL(origin)
+      return url.protocol === 'http:'
+        && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
+    } catch {
+      return false
+    }
+  }
   const origins = new Set([
     ...env.FRONTEND_URL.split(',').map((origin) => origin.trim()).filter(Boolean),
     'https://crm-frontend-rho-lilac.vercel.app',
@@ -27,11 +38,12 @@ export function createApp() {
   ])
 
   app.disable('x-powered-by')
+  app.set('etag', false)
   app.use(requestContext)
   app.use(helmet())
   app.use(cors({
     origin(origin, callback) {
-      if (!origin || origins.has(origin)) return callback(null, true)
+      if (!origin || origins.has(origin) || isLocalDevelopmentOrigin(origin)) return callback(null, true)
       callback(new AppError(403, 'CORS_ORIGIN_DENIED', 'This origin is not allowed to access the API.'))
     },
     credentials: true,
@@ -55,7 +67,16 @@ export function createApp() {
   })
 
   const api = express.Router()
+  api.use((_req, res, next) => {
+    res.set({
+      'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+      Pragma: 'no-cache',
+      Expires: '0',
+    })
+    next()
+  })
   api.use('/auth', authRoutes)
+  api.use('/client-signup-requests', clientSignupRoutes)
   api.use('/users', userRoutes)
   api.use('/roles', roleRoutes)
   api.use('/', analyticsRoutes)

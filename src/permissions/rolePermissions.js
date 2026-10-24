@@ -51,6 +51,7 @@ export const PERMISSION_CATALOG = Object.freeze([
   { key: 'reports.view.financial', label: 'View financial reports', group: 'Reports' },
   { key: 'users.view', label: 'View users', group: 'User access' },
   { key: 'users.manage', label: 'Manage users', group: 'User access' },
+  { key: 'clients.signup.manage', label: 'Review client signup requests', group: 'User access' },
   { key: 'roles.manage', label: 'Manage roles', group: 'User access' },
   { key: 'settings.manage', label: 'Manage system settings', group: 'System' },
   { key: 'notifications.view', label: 'View notifications', group: 'Notifications' },
@@ -60,6 +61,7 @@ export const PERMISSION_CATALOG = Object.freeze([
 const all = PERMISSION_CATALOG.map(({ key }) => key)
 export const CUSTOM_ROLE_FORBIDDEN_PERMISSIONS = Object.freeze([
   'users.manage',
+  'clients.signup.manage',
   'settings.manage',
   'roles.manage',
   'clientPortal.view.own',

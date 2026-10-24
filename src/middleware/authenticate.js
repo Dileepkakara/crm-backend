@@ -23,6 +23,11 @@ export async function authenticate(req, _res, next) {
     }
     const permissions = await resolveRolePermissions(user.role)
     if (!permissions) throw new AppError(401, 'UNAUTHENTICATED', 'This account role is no longer active.')
+    const passwordChangeAllowed = req.baseUrl === '/api/v1/auth'
+      && ['/me', '/password', '/logout'].includes(req.path)
+    if (user.mustChangePassword && !passwordChangeAllowed) {
+      throw new AppError(403, 'PASSWORD_CHANGE_REQUIRED', 'Change your temporary password before accessing the workspace.')
+    }
     user.$locals.effectivePermissions = permissions
     req.user = user
     next()

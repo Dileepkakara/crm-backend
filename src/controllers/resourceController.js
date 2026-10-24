@@ -14,8 +14,10 @@ import {
   transitionQuotation,
   submitAgreement,
   issueInvoice,
+  decideInvoice,
   rejectAgreement,
   updateResource,
+  closeProject,
 } from '../services/resources.js'
 import { Agreement, Project, Notification } from '../models/index.js'
 import { hasPermission } from '../middleware/authorize.js'
@@ -90,6 +92,10 @@ export const issueInvoiceRoute = asyncRoute(async (req, res) => {
   success(res, await issueInvoice(req.params.id, req))
 })
 
+export const invoiceDecisionRoute = asyncRoute(async (req, res) => {
+  success(res, await decideInvoice(req.params.id, req.body, req))
+})
+
 export const refundPaymentRoute = asyncRoute(async (req, res) => {
   success(res, await refundPayment(req.params.id, req.body, req))
 })
@@ -107,6 +113,7 @@ export const createProjectFromAgreement = asyncRoute(async (req, res) => {
   if (!hasPermission(req.user, 'agreements.view') && !hasPermission(req.user, 'agreements.approve')) {
     throw new AppError(403, 'FORBIDDEN', 'You cannot create a project from this work order.')
   }
+  await getResource('agreements', req.params.agreementId, req.user)
   const agreement = await Agreement.findOne({ id: req.params.agreementId })
   if (!agreement || agreement.status !== 'Accepted') throw new AppError(400, 'AGREEMENT_NOT_ACCEPTED', 'Only accepted work orders can create a project.')
   const existing = await Project.findOne({ agreementId: agreement.id })
@@ -132,4 +139,8 @@ export const createProjectFromAgreement = asyncRoute(async (req, res) => {
   await agreement.save()
   await recordAudit(req, 'agreements.project_linked', 'agreements', agreement.id, { projectId: project.record.id })
   success(res, project.record, 201)
+})
+
+export const closeProjectRoute = asyncRoute(async (req, res) => {
+  success(res, await closeProject(req.params.id, req.body, req))
 })

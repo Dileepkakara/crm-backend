@@ -1,4 +1,5 @@
 import bcrypt from 'bcrypt'
+import mongoose from 'mongoose'
 import { AppError } from '../errors/AppError.js'
 import { asyncRoute } from '../middleware/asyncRoute.js'
 import { Client, User } from '../models/index.js'
@@ -7,6 +8,7 @@ import { ROLES } from '../permissions/rolePermissions.js'
 import { success } from '../utils/response.js'
 import { paginationOptions } from '../middleware/pagination.js'
 import { findActiveRole, listRoleDefinitions, serializeUser } from '../services/roles.js'
+import { assertUserCanBeDeleted } from '../services/userDeletion.js'
 
 export const listUsers = asyncRoute(async (req, res) => {
   const { page, limit, skip, sort } = paginationOptions(req.query)
@@ -122,6 +124,35 @@ export const setPassword = asyncRoute(async (req, res) => {
   await user.save()
   await recordAudit(req, 'user.password_changed', 'users', user.id, {})
   success(res, null, 200, 'Password updated.')
+})
+
+export const deleteUser = asyncRoute(async (req, res) => {
+  const session = await mongoose.startSession()
+  try {
+    await session.withTransaction(async () => {
+      const user = await User.findById(req.params.id).session(session)
+      if (!user) throw new AppError(404, 'USER_NOT_FOUND', 'User was not found.')
+      const activeSuperAdminCount = user.role === ROLES.SUPER_ADMIN && user.status === 'Active'
+        ? await User.countDocuments({
+          role: ROLES.SUPER_ADMIN,
+          status: 'Active',
+        }).session(session)
+        : null
+      assertUserCanBeDeleted(req.user, user, activeSuperAdminCount)
+      await recordAudit(req, 'user.deleted', 'users', user.id, {
+        name: user.name,
+        email: user.email,
+        role: user.role,
+      }, session)
+      const result = await user.deleteOne({ session })
+      if (result.deletedCount !== 1) {
+        throw new AppError(409, 'USER_DELETE_CONFLICT', 'The user account could not be deleted. Refresh the page and try again.')
+      }
+    })
+  } finally {
+    await session.endSession()
+  }
+  success(res, { id: req.params.id }, 200, 'User account deleted.')
 })
 
 function escapeRegex(value) {

@@ -5,7 +5,7 @@ import { authenticate } from '../middleware/authenticate.js'
 import { authorize } from '../middleware/authorize.js'
 import { validate } from '../middleware/validate.js'
 import { resourcePermissions } from '../services/resources.js'
-import { resourceSchemas } from '../validation/resourceSchemas.js'
+import { invoiceDecisionSchema, resourceSchemas } from '../validation/resourceSchemas.js'
 
 const idSchema = z.object({ id: z.string().trim().min(1).max(120) })
 const agreementIdSchema = z.object({ agreementId: z.string().trim().min(1).max(120) })
@@ -17,6 +17,10 @@ const reviseSchema = z.object({ reason: z.string().trim().min(1).max(1000) })
 const refundSchema = z.object({ reason: z.string().trim().min(1).max(1000) })
 const agreementRejectSchema = z.object({ reason: z.string().trim().min(1).max(1000) })
 const commentSchema = z.object({ text: z.string().trim().min(1).max(500) })
+const projectCloseSchema = z.object({
+  handoverNotes: z.string().trim().min(1).max(5000),
+  clientReceived: z.literal(true),
+})
 
 export function resourceRouter(resource) {
   const router = Router()
@@ -42,6 +46,7 @@ export function resourceRouter(resource) {
     router.post('/:id/submit', authorize('agreements.approve'), validate({ params: idSchema }), controller.agreementSubmitRoute)
   }
   if (resource === 'invoices') {
+    router.post('/:id/decision', validate({ params: idSchema, body: invoiceDecisionSchema }), controller.invoiceDecisionRoute)
     router.post('/:id/issue', authorize('invoices.manage'), validate({ params: idSchema }), controller.issueInvoiceRoute)
   }
   if (resource === 'payments') {
@@ -55,6 +60,7 @@ export function resourceRouter(resource) {
   }
   if (resource === 'projects') {
     router.post('/from-agreement/:agreementId', authorize('projects.manage'), validate({ params: agreementIdSchema }), controller.createProjectFromAgreement)
+    router.post('/:id/close', authorize('projects.manage'), validate({ params: idSchema, body: projectCloseSchema }), controller.closeProjectRoute)
   }
 
   router.get('/:id', authorize(...permissions.read), validate({ params: idSchema }), controller.get(resource))

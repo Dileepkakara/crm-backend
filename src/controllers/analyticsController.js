@@ -2,7 +2,7 @@ import { AppError } from '../errors/AppError.js'
 import { asyncRoute } from '../middleware/asyncRoute.js'
 import { hasPermission } from '../middleware/authorize.js'
 import { Agreement, Client, Invoice, Payment, Project, Quotation } from '../models/index.js'
-import { listResources, summarizeLeadSources, summarizeResource } from '../services/resources.js'
+import { listResources, safeResource, summarizeLeadSources, summarizeResource } from '../services/resources.js'
 import { success } from '../utils/response.js'
 
 function requireClient(req) {
@@ -16,7 +16,7 @@ export const portal = asyncRoute(async (req, res) => {
   const clientId = req.user.clientId
   const [client, quotations, agreements, invoices, projects, payments] = await Promise.all([
     Client.findOne({ id: clientId }),
-    Quotation.find({ clientId }).sort({ issueDate: -1 }).limit(100),
+    Quotation.find({ clientId, status: { $ne: 'Draft' } }).sort({ issueDate: -1 }).limit(100),
     Agreement.find({ clientId }).sort({ createdAt: -1 }).limit(100),
     Invoice.find({ clientId }).sort({ issueDate: -1 }).limit(100),
     Project.find({ clientId }).sort({ updatedAt: -1 }).limit(100),
@@ -32,9 +32,15 @@ export const portal = asyncRoute(async (req, res) => {
   })
   success(res, {
     client: client.toJSON(),
-    quotations: quotations.map((record) => record.toJSON()),
-    agreements: agreements.map((record) => record.toJSON()),
-    invoices: invoices.map((record) => record.toJSON()),
+    quotations: quotations.map((record) => {
+      const value = record.toJSON()
+      delete value.owner
+      delete value.ownerId
+      delete value.acceptedSnapshot
+      return value
+    }),
+    agreements: agreements.map((record) => safeResource('agreements', record, req.user)),
+    invoices: invoices.map((record) => safeResource('invoices', record, req.user)),
     projects: projects.map((record) => record.toJSON()),
     payments: safePayments,
   })

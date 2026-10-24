@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import { AppError } from '../errors/AppError.js'
 import { hasPermission } from '../middleware/authorize.js'
-import { modelsByResource, Client, Invoice, Payment, Project, Quotation, Agreement, User, Lead } from '../models/index.js'
+import { modelsByResource, Client, Invoice, Payment, Project, Quotation, Agreement, User, Lead, Task } from '../models/index.js'
 import { recordAudit } from './audit.js'
 import { nextId } from './ids.js'
 import { createNotification } from './notifications.js'
@@ -16,7 +16,7 @@ export const resourcePermissions = {
   clients: { read: ['clients.view'], create: ['clients.manage'], update: ['clients.manage'], delete: ['clients.manage'] },
   quotations: { read: ['quotations.view', 'quotations.view.own'], create: ['quotations.create'], update: ['quotations.create'], delete: ['quotations.create'] },
   agreements: { read: ['agreements.view', 'agreements.view.own'], create: ['agreements.approve'], update: ['agreements.approve'], delete: [] },
-  invoices: { read: ['invoices.view', 'invoices.view.own'], create: ['invoices.manage'], update: ['invoices.manage'], delete: [] },
+  invoices: { read: ['invoices.view', 'invoices.view.own', 'invoices.manage'], create: ['invoices.manage'], update: ['invoices.manage'], delete: [] },
   payments: { read: ['payments.view', 'payments.view.own'], create: ['payments.manage'], update: ['payments.manage'], delete: [] },
   projects: { read: ['projects.view', 'projects.view.assigned'], create: ['projects.manage'], update: ['projects.manage'], delete: [] },
   tasks: { read: ['tasks.view', 'tasks.view.assigned'], create: ['tasks.create'], update: ['tasks.update', 'tasks.update.assigned'], delete: ['tasks.delete'] },
@@ -35,6 +35,9 @@ async function findPaymentReplay(key, fingerprint, user) {
 
 const quoteLineItems = (body) => body.items || body.lineItems
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const snapshotFields = (record, fields) => record
+  ? Object.fromEntries(fields.filter((field) => record[field] !== undefined).map((field) => [field, record[field]]))
+  : undefined
 const resourceQuerySchema = paginationSchema.extend({
   from: z.coerce.date().optional(),
   to: z.coerce.date().optional(),
@@ -48,7 +51,10 @@ async function buildScope(resource, user) {
     if (!user.clientId) return { _id: new mongoose.Types.ObjectId('000000000000000000000000') }
     if (resource === 'clients') return { id: user.clientId }
     if (['leads', 'users'].includes(resource)) return { _id: new mongoose.Types.ObjectId('000000000000000000000000') }
-    return { clientId: user.clientId }
+    return {
+      clientId: user.clientId,
+      ...(resource === 'quotations' ? { status: { $ne: 'Draft' } } : {}),
+    }
   }
   if (resource === 'notifications') return { recipientId: user.id }
   if (resource === 'leads' && hasPermission(user, 'leads.view.assigned') && !hasPermission(user, 'leads.view.all')) {
@@ -122,9 +128,11 @@ function recordCanAccess(resource, record, user) {
   return true
 }
 
-async function findScoped(resource, id, user) {
+async function findScoped(resource, id, user, session) {
   const Model = modelsByResource[resource]
-  const record = await Model.findOne({ id, ...(await buildScope(resource, user)) })
+  let query = Model.findOne({ id, ...(await buildScope(resource, user)) })
+  if (session) query = query.session(session)
+  const record = await query
   if (!record || !recordCanAccess(resource, record, user)) throw new AppError(404, 'RECORD_NOT_FOUND', 'Record was not found.')
   return record
 }
@@ -164,6 +172,12 @@ async function calculateFinancialPayload(resource, payload, existing) {
 
 async function preparePayload(resource, payload, user, existing, session) {
   let next = { ...payload }
+  if (resource === 'projects' && existing?.status === 'Closed') {
+    throw new AppError(409, 'PROJECT_CLOSED', 'Closed projects are read-only so their delivery history remains intact.')
+  }
+  if (resource === 'projects' && next.status === 'Closed') {
+    throw new AppError(409, 'PROJECT_CLOSE_WORKFLOW_REQUIRED', 'Use the project handover workflow to close a project.')
+  }
   delete next.id
   delete next.number
   delete next.amount
@@ -175,8 +189,13 @@ async function preparePayload(resource, payload, user, existing, session) {
   delete next.createdAt
   delete next.updatedAt
   delete next.acceptedAt
+  delete next.acceptedBy
   delete next.acceptance
   delete next.acceptedSnapshot
+  delete next.rejectedAt
+  delete next.rejectedBy
+  delete next.rejection
+  delete next.invoiceAllocationVersion
   if (resource === 'leads') {
     if (next.phone) next.normalizedPhone = normalizePhone(next.phone)
     if (!hasPermission(user, 'leads.assign')) {
@@ -195,6 +214,11 @@ async function preparePayload(resource, payload, user, existing, session) {
     }
   }
   if (resource === 'followups') {
+    if (Object.hasOwn(next, 'status')) {
+      next.completedAt = next.status === 'Completed'
+        ? (existing?.status === 'Completed' ? existing.completedAt || new Date() : new Date())
+        : undefined
+    }
     const requestedAssignee = next.assigneeId || next.assignee
     if (!existing && !hasPermission(user, 'followups.assign')) {
       next.assigneeId = user.id
@@ -260,6 +284,7 @@ async function preparePayload(resource, payload, user, existing, session) {
     delete next.issuedAt
     const projectId = next.projectId || existing?.projectId
     const agreementId = next.agreementId || existing?.agreementId
+    let agreement
     if (projectId) {
       const project = await Project.findOne({ id: projectId }).session(session || null)
       if (!project) throw new AppError(400, 'PROJECT_NOT_FOUND', 'The linked project was not found.')
@@ -267,9 +292,130 @@ async function preparePayload(resource, payload, user, existing, session) {
       next.project = project.name
     }
     if (agreementId) {
-      const agreement = await Agreement.findOne({ id: agreementId }).session(session || null)
+      if (!hasPermission(user, 'agreements.view') && !hasPermission(user, 'agreements.view.own')) {
+        throw new AppError(404, 'RECORD_NOT_FOUND', 'Record was not found.')
+      }
+      agreement = await Agreement.findOne({
+        id: agreementId,
+        ...(await buildScope('agreements', user)),
+      }).session(session || null)
+      if (!agreement || !recordCanAccess('agreements', agreement, user)) {
+        throw new AppError(404, 'RECORD_NOT_FOUND', 'Record was not found.')
+      }
       if (!agreement || agreement.status !== 'Accepted') throw new AppError(400, 'AGREEMENT_NOT_ACCEPTED', 'Invoices can only reference an accepted work order.')
       if (agreement.clientId !== (next.clientId || existing?.clientId)) throw new AppError(400, 'CLIENT_MISMATCH', 'The work order belongs to a different client.')
+    }
+
+    const quotationId = next.quotationId || existing?.quotationId || agreement?.quotationId
+    if (existing?.quotationId && next.quotationId && next.quotationId !== existing.quotationId) {
+      throw new AppError(409, 'INVOICE_SOURCE_LOCKED', 'An invoice source cannot be changed after creation.')
+    }
+    if (existing?.agreementId && next.agreementId && next.agreementId !== existing.agreementId) {
+      throw new AppError(409, 'INVOICE_SOURCE_LOCKED', 'An invoice source cannot be changed after creation.')
+    }
+    let quotation
+    if (quotationId) {
+      if (agreement?.quotationId && agreement.quotationId !== quotationId) {
+        throw new AppError(400, 'QUOTATION_MISMATCH', 'The quotation does not match the accepted work order.')
+      }
+      if (!hasPermission(user, 'quotations.view') && !hasPermission(user, 'quotations.view.own')) {
+        throw new AppError(404, 'RECORD_NOT_FOUND', 'Record was not found.')
+      }
+      quotation = await Quotation.findOne({
+        id: quotationId,
+        ...(await buildScope('quotations', user)),
+      }).session(session || null)
+      if (!quotation || !recordCanAccess('quotations', quotation, user)) {
+        throw new AppError(404, 'RECORD_NOT_FOUND', 'Record was not found.')
+      }
+      if (quotation.status !== 'Accepted') {
+        throw new AppError(400, 'QUOTATION_NOT_ACCEPTED', 'Invoices can only reference an accepted quotation.')
+      }
+      if (agreement && quotation.clientId !== agreement.clientId) {
+        throw new AppError(400, 'CLIENT_MISMATCH', 'The quotation and work order belong to different clients.')
+      }
+    }
+
+    if (agreement || quotationId) {
+      const sourceClientId = agreement?.clientId || quotation?.clientId
+      if (!sourceClientId || (next.clientId && next.clientId !== sourceClientId)) {
+        throw new AppError(400, 'CLIENT_MISMATCH', 'The invoice client must match its accepted source.')
+      }
+      const acceptedQuotation = quotation?.acceptedSnapshot
+      const sourceData = quotation
+        ? (acceptedQuotation?.items?.length || acceptedQuotation?.lineItems?.length
+          ? acceptedQuotation
+          : quotation.toJSON())
+        : (agreement?.quotationSnapshot || agreement?.acceptedSnapshot?.quotationSnapshot)
+      const sourceItems = sourceData?.items?.length ? sourceData.items : sourceData?.lineItems
+      if (!sourceItems?.length) {
+        throw new AppError(400, 'SOURCE_ITEMS_REQUIRED', 'The accepted source has no saved line items to invoice.')
+      }
+      const sourceKey = `contract:${quotationId ? `quotation:${quotationId}` : `agreement:${agreement.id}`}`
+      const allocationModel = quotation ? Quotation : Agreement
+      const allocationId = quotation?.id || agreement?.id
+      const allocationUpdate = await allocationModel.updateOne(
+        { id: allocationId, status: 'Accepted' },
+        { $inc: { invoiceAllocationVersion: 1 } },
+      ).session(session || null)
+      if (!allocationUpdate.matchedCount) {
+        throw new AppError(409, 'CONTRACT_NOT_ACCEPTED', 'The accepted contract changed. Reload it before creating an invoice.')
+      }
+
+      next.clientId = sourceClientId
+      next.client = quotation?.client || agreement?.client || next.client
+      next.agreementId = agreement?.id
+      next.quotationId = quotationId
+      next.billingSourceKey = existing?.billingSourceKey || sourceKey
+      next.sourceSnapshot = existing?.sourceSnapshot || {
+        kind: agreement ? 'agreement' : 'quotation',
+        agreement: snapshotFields(agreement?.toObject?.(), [
+          'id', 'quotationId', 'clientId', 'client', 'projectId', 'project',
+          'scope', 'deliverables', 'startDate', 'deadline', 'paymentMilestones',
+          'terms', 'status', 'acceptedAt',
+        ]),
+        quotation: snapshotFields(sourceData, [
+          'id', 'number', 'clientId', 'client', 'title', 'issueDate', 'validUntil',
+          'items', 'lineItems', 'subtotal', 'discount', 'taxableValue', 'gstEnabled',
+          'sgstEnabled', 'cgstEnabled', 'sgstRate', 'cgstRate', 'sgstAmount',
+          'cgstAmount', 'tax', 'total', 'amount', 'terms', 'billingName',
+          'billingAddress', 'customerGstin', 'contactEmail', 'contactPhone',
+          'companyGstin', 'companyAddress', 'bankDetails',
+        ]),
+      }
+      if (!quoteLineItems(next)?.length) next.items = existing?.items?.length ? existing.items : sourceItems
+      delete next.lineItems
+      next.discount ??= existing?.discount ?? sourceData.discount ?? 0
+      next.gstEnabled ??= existing?.gstEnabled ?? Boolean(sourceData.gstEnabled)
+      next.sgstEnabled ??= existing?.sgstEnabled ?? sourceData.sgstEnabled ?? true
+      next.cgstEnabled ??= existing?.cgstEnabled ?? sourceData.cgstEnabled ?? true
+      next.sgstRate ??= existing?.sgstRate ?? sourceData.sgstRate ?? 0
+      next.cgstRate ??= existing?.cgstRate ?? sourceData.cgstRate ?? 0
+      next.terms ??= existing?.terms ?? sourceData.terms
+      next.billingName ??= existing?.billingName ?? sourceData.billingName
+      next.billingAddress ??= existing?.billingAddress ?? sourceData.billingAddress
+      next.customerGstin ??= existing?.customerGstin ?? sourceData.customerGstin
+      next.contactEmail ??= existing?.contactEmail ?? sourceData.contactEmail
+      next.contactPhone ??= existing?.contactPhone ?? sourceData.contactPhone
+      next.project = next.project || existing?.project || agreement?.project || sourceData.title
+      if (agreement?.projectId) {
+        const agreementProject = await Project.findOne({ id: agreement.projectId }).session(session || null)
+        if (!agreementProject || agreementProject.clientId !== sourceClientId
+          || agreementProject.agreementId !== agreement.id) {
+          throw new AppError(400, 'PROJECT_MISMATCH', 'The linked project does not belong to this accepted work order.')
+        }
+        if (agreementProject.status === 'Closed') {
+          throw new AppError(409, 'PROJECT_CLOSED', 'A closed project cannot receive new invoices.')
+        }
+        next.projectId = agreementProject.id
+        next.project = agreementProject.name
+      }
+    }
+    if (next.projectId || existing?.projectId) {
+      const linkedProject = await Project.findOne({ id: next.projectId || existing.projectId }).session(session || null)
+      if (linkedProject?.status === 'Closed') {
+        throw new AppError(409, 'PROJECT_CLOSED', 'A closed project cannot receive new invoices.')
+      }
     }
   }
   if (resource === 'payments') {
@@ -289,6 +435,7 @@ async function preparePayload(resource, payload, user, existing, session) {
   if (resource === 'tasks') {
     const project = await Project.findOne({ id: next.projectId || existing?.projectId }).session(session || null)
     if (!project) throw new AppError(400, 'PROJECT_NOT_FOUND', 'The selected project was not found.')
+    if (project.status === 'Closed') throw new AppError(409, 'PROJECT_CLOSED', 'Tasks in a closed project cannot be changed.')
     if (user.role === 'developer' && Object.keys(next).some((field) => !['status', 'progress'].includes(field))) {
       throw new AppError(403, 'TASK_FIELDS_FORBIDDEN', 'Developers may update only task status and progress.')
     }
@@ -314,6 +461,35 @@ async function preparePayload(resource, payload, user, existing, session) {
   return next
 }
 
+async function validateInvoiceAllocation(payload, existing, session) {
+  if (!payload.quotationId && !payload.agreementId) return
+  const source = payload.sourceSnapshot?.quotation || payload.sourceSnapshot?.agreement
+  const contractTotal = Number(source?.total ?? source?.amount)
+  if (!Number.isFinite(contractTotal) || contractTotal <= 0) {
+    throw new AppError(400, 'CONTRACT_TOTAL_REQUIRED', 'The accepted contract does not have a valid total for invoice allocation.')
+  }
+
+  const sources = []
+  if (payload.quotationId) sources.push({ quotationId: payload.quotationId })
+  if (payload.agreementId) sources.push({ agreementId: payload.agreementId })
+  const invoices = await Invoice.find({
+    $or: sources,
+    status: { $ne: 'Cancelled' },
+  }).session(session || null)
+  const allocated = invoices
+    .filter((invoice) => invoice.id !== existing?.id)
+    .reduce((sum, invoice) => sum + Number(invoice.total || invoice.amount || 0), 0)
+  const totalWithCurrent = toMoney(allocated + Number(payload.total || payload.amount || 0))
+  if (totalWithCurrent > toMoney(contractTotal)) {
+    const remaining = toMoney(Math.max(0, contractTotal - allocated))
+    throw new AppError(
+      409,
+      'INVOICE_EXCEEDS_CONTRACT',
+      `This invoice exceeds the remaining accepted contract amount of ${remaining}.`,
+    )
+  }
+}
+
 function searchableFields(resource) {
   return {
     leads: ['id', 'name', 'company', 'email', 'phone', 'service', 'source'],
@@ -334,7 +510,11 @@ export async function listResources(resource, req) {
   const query = resourceQuerySchema.parse(req.query)
   const { page, limit, sort, order } = query
   const filter = { ...(await buildScope(resource, req.user)) }
-  if (query.status && resource !== 'notifications') filter.status = query.status
+  if (query.status && resource !== 'notifications') {
+    filter.status = resource === 'quotations' && req.user.role === 'client' && query.status === 'Draft'
+      ? '__client_cannot_view_draft__'
+      : query.status
+  }
   if (query.read !== undefined && resource === 'notifications') filter.read = query.read === 'true'
   if (query.assigneeId && ['leads', 'followups', 'tasks'].includes(resource)) filter.assigneeId = query.assigneeId
   if (query.from || query.to) {
@@ -463,11 +643,35 @@ export async function getResource(resource, id, user) {
   return safeResource(resource, record, user)
 }
 
-function safeResource(resource, record, user) {
+export function safeResource(resource, record, user) {
   const value = record.toJSON()
   if (user.role === 'client' && resource === 'payments') {
     delete value.recordedBy
     delete value.recordedById
+  }
+  if (user.role === 'client' && resource === 'quotations') {
+    delete value.owner
+    delete value.ownerId
+    delete value.acceptedSnapshot
+  }
+  if (user.role === 'client' && resource === 'agreements') {
+    delete value.acceptedSnapshot
+    if (value.quotationSnapshot) {
+      value.quotationSnapshot = { ...value.quotationSnapshot }
+      for (const field of [
+        'owner',
+        'ownerId',
+        'acceptedBy',
+        'acceptedAt',
+        'acceptance',
+        'acceptedSnapshot',
+        'rejectedBy',
+        'rejectedAt',
+        'rejection',
+      ]) {
+        delete value.quotationSnapshot[field]
+      }
+    }
   }
   return value
 }
@@ -482,6 +686,10 @@ export async function createResource(resource, body, req) {
     await session.withTransaction(async () => {
       let payload = await preparePayload(resource, body, req.user, null, session)
       payload.id = await nextId(resource, session)
+      if (resource === 'invoices' && payload.billingSourceKey) {
+        payload.billingSourceKey = `${payload.billingSourceKey}:invoice:${payload.id}`
+      }
+      if (resource === 'invoices') await validateInvoiceAllocation(payload, null, session)
       if (resource === 'leads') {
         payload.status = 'New'
         payload.createdAt = payload.createdAt || new Date()
@@ -520,12 +728,22 @@ export async function createResource(resource, body, req) {
 
 export async function updateResource(resource, id, body, req) {
   if (resource === 'payments') return updatePayment(id, body, req)
+  if (resource === 'invoices' && Object.keys(body).some((field) => [
+    'status', 'amountPaid', 'balance', 'payments', 'paymentIds',
+  ].includes(field))) {
+    throw new AppError(
+      409,
+      'USE_INVOICE_WORKFLOW',
+      'Invoice status and payment totals are managed through the issue, payment, and refund workflows.',
+    )
+  }
   const session = await mongoose.startSession()
   let record
   try {
     await session.withTransaction(async () => {
-      const current = await findScoped(resource, id, req.user)
+      const current = await findScoped(resource, id, req.user, session)
       let payload = await preparePayload(resource, body, req.user, current, session)
+      if (resource === 'invoices') await validateInvoiceAllocation(payload, current, session)
       if (resource === 'notifications' && Object.hasOwn(payload, 'read')) {
         if (current.recipientId !== req.user.id) throw new AppError(404, 'RECORD_NOT_FOUND', 'Record was not found.')
       }
@@ -543,30 +761,129 @@ export async function updateResource(resource, id, body, req) {
   return record.toJSON()
 }
 
+export async function closeProject(id, body, req) {
+  if (!hasPermission(req.user, 'projects.manage')) {
+    throw new AppError(403, 'FORBIDDEN', 'You cannot close this project.')
+  }
+  const session = await mongoose.startSession()
+  let project
+  try {
+    await session.withTransaction(async () => {
+      const current = await Project.findOne({
+        id,
+        ...(await buildScope('projects', req.user)),
+      }).session(session)
+      if (!current || !recordCanAccess('projects', current, req.user)) {
+        throw new AppError(404, 'RECORD_NOT_FOUND', 'Record was not found.')
+      }
+      if (current.status !== 'Completed') {
+        throw new AppError(409, 'PROJECT_NOT_COMPLETE', 'Complete project delivery before recording handover and closing it.')
+      }
+
+      const tasks = await Task.find({ projectId: current.id }).session(session)
+      if (tasks.some((task) => task.status !== 'Completed')) {
+        throw new AppError(409, 'DELIVERY_TASKS_INCOMPLETE', 'Complete all project tasks before closing the project.')
+      }
+
+      const invoiceLinks = [{ projectId: current.id }]
+      if (current.agreementId) invoiceLinks.push({ agreementId: current.agreementId })
+      else if (current.quotationId) invoiceLinks.push({ quotationId: current.quotationId })
+      const invoices = await Invoice.find({ $or: invoiceLinks }).session(session)
+      const billableInvoices = invoices.filter((invoice) => invoice.status !== 'Cancelled')
+      if (!billableInvoices.length) {
+        throw new AppError(409, 'FINAL_INVOICE_REQUIRED', 'Record and settle the project’s final invoice before closing it.')
+      }
+      const unpaidInvoices = billableInvoices.filter((invoice) =>
+        invoice.status !== 'Paid'
+        || Number(invoice.balance ?? (Number(invoice.total || 0) - Number(invoice.amountPaid || 0))) > 0
+        || Number(invoice.amountPaid || 0) < Number(invoice.total || 0))
+      if (unpaidInvoices.length) {
+        throw new AppError(409, 'INVOICES_UNSETTLED', 'Settle every project invoice before recording final handover.')
+      }
+
+      current.status = 'Closed'
+      current.handover = {
+        notes: body.handoverNotes.trim(),
+        clientReceived: true,
+        confirmedAt: new Date(),
+        confirmedBy: req.user.id,
+      }
+      current.closedAt = current.handover.confirmedAt
+      current.closedBy = req.user.id
+      project = await current.save({ session })
+      await recordAudit(req, 'projects.handover_closed', 'projects', project.id, {
+        status: project.status,
+        clientReceived: true,
+        handoverNotes: project.handover.notes,
+        invoiceIds: billableInvoices.map((invoice) => invoice.id),
+      }, session)
+    })
+  } finally {
+    await session.endSession()
+  }
+  return project.toJSON()
+}
+
 export async function deleteResource(resource, id, req) {
+  if (resource === 'quotations') return deleteQuotation(id, req)
   if (resource === 'payments' || resource === 'invoices' || resource === 'agreements') {
     throw new AppError(409, 'IMMUTABLE_RESOURCE', 'This record cannot be deleted; use its cancellation or reversal workflow.')
   }
   const record = await findScoped(resource, id, req.user)
-  if (resource === 'quotations' && record.status !== 'Draft') {
-    throw new AppError(409, 'QUOTATION_DELETE_RESTRICTED', 'Only draft quotations can be deleted.')
-  }
   await record.deleteOne()
   await recordAudit(req, `${resource}.deleted`, resource, id, {})
   return { id }
 }
 
+async function deleteQuotation(id, req) {
+  const session = await mongoose.startSession()
+  try {
+    await session.withTransaction(async () => {
+      const quotation = await Quotation.findOne({
+        id,
+        ...(await buildScope('quotations', req.user)),
+      }).session(session)
+      if (!quotation || !recordCanAccess('quotations', quotation, req.user)) {
+        throw new AppError(404, 'RECORD_NOT_FOUND', 'Record was not found.')
+      }
+      if (quotation.status !== 'Draft') {
+        throw new AppError(409, 'QUOTATION_DELETE_RESTRICTED', 'Only draft quotations can be deleted.')
+      }
+
+      const [agreement, invoice, project, revision] = await Promise.all([
+        Agreement.exists({ quotationId: id }).session(session),
+        Invoice.exists({ quotationId: id }).session(session),
+        Project.exists({ quotationId: id }).session(session),
+        Quotation.exists({ revisionOf: id }).session(session),
+      ])
+      if (agreement || invoice || project || revision) {
+        throw new AppError(
+          409,
+          'QUOTATION_LINKED',
+          'This quotation is linked to another business record or revision and cannot be deleted.',
+        )
+      }
+
+      await quotation.deleteOne({ session })
+      await recordAudit(req, 'quotations.deleted', 'quotations', id, {}, session)
+    })
+  } finally {
+    await session.endSession()
+  }
+  return { id }
+}
+
 async function createPayment(body, req) {
   const suppliedKey = req.get('Idempotency-Key')?.trim()
-  const key = suppliedKey ? `${req.user.id}:${suppliedKey}` : undefined
-  if (key && key.length > 160) throw new AppError(400, 'INVALID_IDEMPOTENCY_KEY', 'Idempotency-Key is too long.')
   const fingerprint = createHash('sha256').update(JSON.stringify([
     body.invoiceId, body.amount, body.date, body.method, body.reference || '', body.transactionReference || '',
   ])).digest('hex')
-  if (key) {
-    const replay = await findPaymentReplay(key, fingerprint, req.user)
-    if (replay) return replay
-  }
+  const key = suppliedKey
+    ? `${req.user.id}:${suppliedKey}`
+    : `auto:${createHash('sha256').update(`${req.user.id}:${Math.floor(Date.now() / 300000)}:${fingerprint}`).digest('hex')}`
+  if (key.length > 160) throw new AppError(400, 'INVALID_IDEMPOTENCY_KEY', 'Idempotency-Key is too long.')
+  const replay = await findPaymentReplay(key, fingerprint, req.user)
+  if (replay) return replay
   const session = await mongoose.startSession()
   let payment
   try {
@@ -609,7 +926,7 @@ async function createPayment(body, req) {
       }, session)
     })
   } catch (error) {
-    if (key && error.code === 11000) {
+    if (error.code === 11000) {
       const replay = await findPaymentReplay(key, fingerprint, req.user)
       if (replay) return replay
     }
@@ -634,6 +951,19 @@ async function updatePayment(id, body, req) {
 async function convertLeadInTransaction(lead, req, session) {
   const existing = await Client.findOne({ leadId: lead.id }).session(session)
   if (existing) return { client: existing.toJSON(), created: false }
+  const emailMatches = await Client.find({ email: lead.email.toLowerCase() }).session(session)
+  if (emailMatches.length > 1) {
+    throw new AppError(409, 'CLIENT_MATCH_AMBIGUOUS', 'More than one client uses this lead email. Resolve the duplicate client records before conversion.')
+  }
+  if (emailMatches.length === 1) {
+    const client = emailMatches[0]
+    if (!client.leadId) {
+      client.leadId = lead.id
+      await client.save({ session })
+    }
+    await recordAudit(req, 'leads.converted', 'leads', lead.id, { clientId: client.id, linkedExistingClient: true }, session)
+    return { client: client.toJSON(), created: false }
+  }
   const client = await Client.create([{
     id: await nextId('clients', session),
     leadId: lead.id,
@@ -658,7 +988,7 @@ export async function convertLead(id, req) {
   let result
   try {
     await session.withTransaction(async () => {
-      const lead = await findScoped('leads', id, req.user)
+      const lead = await findScoped('leads', id, req.user, session)
       if (lead.status === 'Lost') throw new AppError(409, 'LEAD_NOT_CONVERTIBLE', 'Lost leads cannot be converted.')
       const conversion = await convertLeadInTransaction(lead, req, session)
       lead.status = 'Won'
@@ -699,22 +1029,110 @@ export async function transitionQuotation(id, action, body, req) {
     if (action === 'send' && quote.status !== 'Draft') throw new AppError(409, 'INVALID_TRANSITION', 'Only draft quotations can be sent.')
     if (action === 'approve' && !['Sent', 'Viewed'].includes(quote.status)) throw new AppError(409, 'INVALID_TRANSITION', 'Only sent quotations can be accepted.')
     if (action === 'reject' && !['Sent', 'Viewed'].includes(quote.status)) throw new AppError(409, 'INVALID_TRANSITION', 'Only sent quotations can be rejected.')
+    const previousStatus = quote.status
     quote.status = action === 'send' ? 'Sent' : action === 'approve' ? 'Accepted' : 'Rejected'
-    if (action === 'send') quote.sentAt = new Date()
+    const changes = { status: quote.status }
+    if (action === 'send') {
+      quote.sentAt = new Date()
+      changes.sentAt = quote.sentAt
+    }
     if (action === 'approve') {
       quote.acceptedAt = new Date()
-      quote.acceptance = { acceptedBy: req.user.id, acceptedAt: quote.acceptedAt, method: 'authenticated-portal-acknowledgement' }
+      quote.acceptedBy = req.user.id
+      quote.acceptance = {
+        quotationId: quote.id,
+        version: quote.version,
+        acceptedBy: req.user.id,
+        acceptedByRole: req.user.role,
+        acceptedAt: quote.acceptedAt,
+        method: isClientTransition ? 'client-portal' : 'staff-approval',
+      }
       quote.acceptedSnapshot = quote.toObject()
+      changes.acceptedAt = quote.acceptedAt
+      changes.acceptedBy = quote.acceptedBy
+      changes.acceptance = quote.acceptance
+      changes.acceptedSnapshot = quote.acceptedSnapshot
     }
-    if (action === 'reject') quote.rejectedAt = new Date()
-    await quote.save()
-    await recordAudit(req, `quotations.${action}`, 'quotations', quote.id, { status: quote.status })
-    if (action === 'send' && quote.clientId) {
-      const account = await User.findOne({ clientId: quote.clientId, role: 'client', status: 'Active' })
-      if (account) await createNotification({
-        recipientId: account.id, title: 'Quotation updated', body: `${quote.id} · ${quote.title}`,
-        category: 'Sales', href: '/client-portal', eventType: `quotation.${action}`,
+    if (action === 'reject') {
+      quote.rejectedAt = new Date()
+      quote.rejectedBy = req.user.id
+      quote.rejection = {
+        quotationId: quote.id,
+        version: quote.version,
+        rejectedBy: req.user.id,
+        rejectedByRole: req.user.role,
+        rejectedAt: quote.rejectedAt,
+        method: isClientTransition ? 'client-portal' : 'staff-decision',
+      }
+      changes.rejectedAt = quote.rejectedAt
+      changes.rejectedBy = quote.rejectedBy
+      changes.rejection = quote.rejection
+    }
+    const session = await mongoose.startSession()
+    try {
+      await session.withTransaction(async () => {
+        const transition = await Quotation.updateOne({
+          ...(quote._id ? { _id: quote._id } : { id: quote.id }),
+          status: action === 'send' ? 'Draft' : { $in: ['Sent', 'Viewed'] },
+        }, { $set: changes }, { session })
+        if (transition.matchedCount !== 1) {
+          throw new AppError(409, 'INVALID_TRANSITION', 'This quotation has already been sent or decided. Refresh the page and try again.')
+        }
+        await recordAudit(req, `quotations.${action}`, 'quotations', quote.id, {
+          status: quote.status,
+          ...(action === 'approve' ? {
+            version: quote.version,
+            acceptedBy: quote.acceptedBy,
+            acceptedByRole: quote.acceptance.acceptedByRole,
+            method: quote.acceptance.method,
+            acceptedAt: quote.acceptedAt,
+          } : action === 'reject' ? {
+            version: quote.version,
+            rejectedBy: quote.rejectedBy,
+            rejectedByRole: quote.rejection.rejectedByRole,
+            method: quote.rejection.method,
+            rejectedAt: quote.rejectedAt,
+          } : { previousStatus }),
+        }, session)
+
+        if (action === 'send' && quote.clientId) {
+          const account = await User.findOne({ clientId: quote.clientId, role: 'client', status: 'Active' }).session(session)
+          if (account) await createNotification({
+            recipientId: account.id, title: 'Quotation updated', body: `${quote.id} · ${quote.title}`,
+            category: 'Sales', href: '/client-portal', eventType: `quotation.${action}`,
+            dedupeKey: `quotation:${quote.id}:v${quote.version}:sent:${account.id}`,
+          }, session)
+        } else if (isClientTransition) {
+          const recipients = new Map()
+          if (quote.ownerId && mongoose.isValidObjectId(quote.ownerId)) {
+            const owner = await User.findOne({
+              _id: quote.ownerId,
+              role: { $ne: 'client' },
+              status: 'Active',
+            }).select('id').session(session)
+            if (owner) recipients.set(owner.id, owner)
+          }
+          const admins = await User.find({ role: 'super_admin', status: 'Active' }).select('id').session(session)
+          for (const admin of admins) recipients.set(admin.id, admin)
+          if (!recipients.size) {
+            throw new AppError(503, 'NO_NOTIFICATION_RECIPIENT', 'The quotation decision could not be recorded because no internal recipient is available.')
+          }
+          const decision = action === 'approve' ? 'accepted' : 'rejected'
+          for (const recipient of recipients.values()) {
+            await createNotification({
+              recipientId: recipient.id,
+              title: `Quotation ${decision} by client`,
+              body: `${quote.client || 'Client'} · ${quote.number || quote.id} · ${quote.title}`,
+              category: 'Sales',
+              href: '/quotations',
+              eventType: `quotation.client_${decision}`,
+              dedupeKey: `quotation:${quote.id}:v${quote.version}:client_${decision}:${recipient.id}`,
+            }, session)
+          }
+        }
       })
+    } finally {
+      await session.endSession()
     }
     return quote.toJSON()
   }
@@ -736,8 +1154,13 @@ export async function transitionQuotation(id, action, body, req) {
       status: 'Draft',
       sentAt: undefined,
       acceptedAt: undefined,
+      acceptedBy: undefined,
       acceptedSnapshot: undefined,
       acceptance: undefined,
+      rejectedAt: undefined,
+      rejectedBy: undefined,
+      rejection: undefined,
+      invoiceAllocationVersion: 0,
     }).save()
     await recordAudit(req, 'quotations.revised', 'quotations', revision.id, { revisionOf: quote.id, version: revision.version })
     return revision.toJSON()
@@ -820,6 +1243,68 @@ export async function issueInvoice(id, req) {
     href: '/client-portal',
     eventType: 'invoice.issued',
   })
+  return invoice.toJSON()
+}
+
+export async function decideInvoice(id, body, req) {
+  if (req.user.role !== 'client' || !req.user.clientId) {
+    throw new AppError(403, 'CLIENT_PORTAL_ONLY', 'Only a linked client account can record an invoice decision.')
+  }
+  const invoice = await findScoped('invoices', id, req.user)
+  if (!['Issued', 'Partially Paid', 'Overdue'].includes(invoice.status)) {
+    throw new AppError(409, 'INVALID_TRANSITION', 'Only issued, overdue, or partially paid invoices can be accepted or rejected.')
+  }
+  if (invoice.clientDecision?.status) {
+    throw new AppError(409, 'INVALID_TRANSITION', 'This invoice already has a client decision.')
+  }
+  if (body.decision === 'Rejected' && !body.reason?.trim()) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'A reason is required when rejecting an invoice.')
+  }
+
+  const decision = {
+    status: body.decision,
+    decidedAt: new Date(),
+    decidedBy: req.user.id,
+    ...(body.decision === 'Rejected' ? { reason: body.reason.trim() } : {}),
+  }
+  const session = await mongoose.startSession()
+  try {
+    await session.withTransaction(async () => {
+      const result = await Invoice.updateOne({
+        ...(invoice._id ? { _id: invoice._id } : { id: invoice.id }),
+        clientId: req.user.clientId,
+        status: { $in: ['Issued', 'Partially Paid', 'Overdue'] },
+        'clientDecision.status': { $exists: false },
+      }, { $set: { clientDecision: decision } }, { session })
+      if (result.matchedCount !== 1) {
+        throw new AppError(409, 'INVALID_TRANSITION', 'This invoice has already been decided or is no longer eligible. Refresh the page and try again.')
+      }
+
+      await recordAudit(req, `invoices.client_${body.decision.toLowerCase()}`, 'invoices', invoice.id, {
+        decision: body.decision,
+        ...(decision.reason ? { reason: decision.reason } : {}),
+      }, session)
+
+      const admins = await User.find({ role: 'super_admin', status: 'Active' }).select('id').session(session)
+      if (!admins.length) {
+        throw new AppError(503, 'NO_NOTIFICATION_RECIPIENT', 'The invoice decision could not be recorded because no internal recipient is available.')
+      }
+      for (const admin of admins) {
+        await createNotification({
+          recipientId: admin.id,
+          title: `Invoice ${body.decision.toLowerCase()} by client`,
+          body: `${invoice.client || 'Client'} · ${invoice.number || invoice.id}`,
+          category: 'Finance',
+          href: '/invoices',
+          eventType: `invoice.client_${body.decision.toLowerCase()}`,
+          dedupeKey: `invoice:${invoice.id}:client_${body.decision.toLowerCase()}:${admin.id}`,
+        }, session)
+      }
+    })
+  } finally {
+    await session.endSession()
+  }
+  invoice.clientDecision = decision
   return invoice.toJSON()
 }
 

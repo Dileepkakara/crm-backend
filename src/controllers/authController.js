@@ -10,6 +10,11 @@ export const login = asyncRoute(async (req, res) => {
   success(res, session)
 })
 
+export const clientLogin = asyncRoute(async (req, res) => {
+  const session = await authService.login(req.body, res, 'client')
+  success(res, session)
+})
+
 export const refresh = asyncRoute(async (req, res) => {
   const session = await authService.refresh(req, res)
   success(res, session)
