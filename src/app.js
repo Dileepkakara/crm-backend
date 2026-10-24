@@ -32,7 +32,7 @@ export function createApp() {
   }
   const origins = new Set([
     ...env.FRONTEND_URL.split(',').map((origin) => origin.trim()).filter(Boolean),
-    'https://crm-frontend-rho-lilac.vercel.app',
+    'https://crm-frontend-hszt.vercel.app',
     'https://crm-frontend-git-main-dileeps-projects-efeb0f16.vercel.app',
     'https://crm-frontend-audztfl0o-dileeps-projects-efeb0f16.vercel.app',
   ])
