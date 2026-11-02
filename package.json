@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "bcrypt": "^6.0.0",
+    "cloudinary": "^2.11.0",
     "cors": "^2.8.5",
     "decimal.js": "^10.6.0",
     "dotenv": "^16.6.1",
@@ -24,6 +25,7 @@
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.19.1",
+    "multer": "^2.5.0",
     "pino": "^9.13.0",
     "pino-http": "^10.5.0",
     "zod": "^4.1.12"

@@ -35,9 +35,35 @@ async function findPaymentReplay(key, fingerprint, user) {
 
 const quoteLineItems = (body) => body.items || body.lineItems
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const documentContentFields = {
+  quotations: ['clientId', 'title', 'issueDate', 'validUntil', 'items', 'discount', 'gstEnabled', 'sgstEnabled', 'cgstEnabled', 'sgstRate', 'cgstRate', 'terms', 'billingName', 'billingAddress', 'customerGstin', 'contactEmail', 'contactPhone', 'companyGstin', 'companyAddress', 'bankDetails'],
+  invoices: ['clientId', 'issueDate', 'dueDate', 'items', 'discount', 'gstEnabled', 'sgstEnabled', 'cgstEnabled', 'sgstRate', 'cgstRate', 'terms', 'billingName', 'billingAddress', 'customerGstin', 'contactEmail', 'contactPhone', 'companyGstin', 'companyAddress', 'bankDetails', 'status'],
+  agreements: ['clientId', 'project', 'createdAt', 'startDate', 'deadline', 'scope', 'deliverables', 'paymentMilestones', 'terms', 'billingName', 'billingAddress', 'customerGstin', 'contactEmail', 'contactPhone', 'companyGstin', 'companyAddress', 'bankDetails', 'total', 'amount', 'status'],
+}
 const snapshotFields = (record, fields) => record
   ? Object.fromEntries(fields.filter((field) => record[field] !== undefined).map((field) => [field, record[field]]))
   : undefined
+function documentContentSnapshot(resource, record) {
+  const fields = documentContentFields[resource]
+  if (!fields) return ''
+  const source = record.toObject ? record.toObject() : record
+  const values = Object.fromEntries(fields.map((field) => [field, source[field]]))
+  values.items = (source.items || source.lineItems || []).map(({ description, quantity, rate }) => ({ description, quantity, rate }))
+  return JSON.stringify(values)
+}
+
+function markDocumentStale(record) {
+  if (record.documentVersions?.length) record.documentNeedsRegeneration = true
+}
+
+async function markClientDocumentsStale(clientId, session) {
+  await Promise.all(['quotations', 'invoices', 'agreements'].map((resource) =>
+    modelsByResource[resource].updateMany(
+      { clientId, 'documentVersions.0': { $exists: true } },
+      { $set: { documentNeedsRegeneration: true } },
+      { session },
+    )))
+}
 const resourceQuerySchema = paginationSchema.extend({
   from: z.coerce.date().optional(),
   to: z.coerce.date().optional(),
@@ -54,6 +80,8 @@ async function buildScope(resource, user) {
     return {
       clientId: user.clientId,
       ...(resource === 'quotations' ? { status: { $ne: 'Draft' } } : {}),
+      ...(resource === 'invoices' ? { status: { $nin: ['Draft', 'Cancelled'] } } : {}),
+      ...(resource === 'agreements' ? { status: { $in: ['Pending approval', 'Accepted'] } } : {}),
     }
   }
   if (resource === 'notifications') return { recipientId: user.id }
@@ -673,6 +701,27 @@ export function safeResource(resource, record, user) {
       }
     }
   }
+  if (Array.isArray(value.documentVersions)) {
+    if (user.role === 'client') {
+      value.documentVersions = value.documentNeedsRegeneration
+        ? []
+        : value.documentVersions.filter((item) => item.isCurrentVersion)
+    }
+    value.documentVersions = value.documentVersions.map((item) => {
+      const metadata = { ...item }
+      delete metadata.cloudinaryUrl
+      delete metadata.cloudinaryPublicId
+      return metadata
+    })
+  }
+  if (Array.isArray(value.attachments)) {
+    value.attachments = value.attachments.map((item) => {
+      const metadata = { ...item }
+      delete metadata.cloudinaryUrl
+      delete metadata.cloudinaryPublicId
+      return metadata
+    })
+  }
   return value
 }
 
@@ -744,6 +793,11 @@ export async function updateResource(resource, id, body, req) {
       const current = await findScoped(resource, id, req.user, session)
       let payload = await preparePayload(resource, body, req.user, current, session)
       if (resource === 'invoices') await validateInvoiceAllocation(payload, current, session)
+      const clientDocumentFieldsChanged = resource === 'clients'
+        && ['name', 'company', 'address', 'gstin', 'email', 'phone']
+          .some((field) => Object.hasOwn(payload, field) && payload[field] !== current[field])
+      const documentContentChanged = documentContentFields[resource]
+        && documentContentSnapshot(resource, current) !== documentContentSnapshot(resource, { ...current.toObject(), ...payload })
       if (resource === 'notifications' && Object.hasOwn(payload, 'read')) {
         if (current.recipientId !== req.user.id) throw new AppError(404, 'RECORD_NOT_FOUND', 'Record was not found.')
       }
@@ -752,7 +806,9 @@ export async function updateResource(resource, id, body, req) {
         payload.convertedClientId = converted.client.id
       }
       current.set(payload)
+      if (documentContentChanged) markDocumentStale(current)
       record = await current.save({ session })
+      if (clientDocumentFieldsChanged) await markClientDocumentsStale(current.id, session)
       await recordAudit(req, `${resource}.updated`, resource, record.id, { fields: Object.keys(payload) }, session)
     })
   } finally {
@@ -913,6 +969,7 @@ async function createPayment(body, req) {
       invoice.amountPaid = newPaid
       invoice.balance = toMoney(Math.max(0, invoice.total - newPaid))
       invoice.status = invoice.balance <= 0 ? 'Paid' : 'Partially Paid'
+      markDocumentStale(invoice)
       await invoice.save({ session })
       await recordAudit(req, 'payments.recorded', 'payments', payment.id, { invoiceId: invoice.id, amount: payment.amount }, session)
       const clientUser = await User.findOne({ clientId: invoice.clientId, role: 'client', status: 'Active' }).session(session)
@@ -1175,6 +1232,7 @@ export async function acceptAgreement(id, req) {
   }
   if (agreement.status !== 'Pending approval') throw new AppError(409, 'INVALID_TRANSITION', 'Only work orders pending approval can be accepted.')
   agreement.status = 'Accepted'
+  markDocumentStale(agreement)
   agreement.acceptedAt = new Date()
   agreement.acceptedBy = req.user.id
   agreement.acceptance = { acceptedBy: req.user.id, acceptedAt: agreement.acceptedAt, method: 'authenticated-portal-acknowledgement' }
@@ -1191,6 +1249,7 @@ export async function rejectAgreement(id, reason, req) {
   }
   if (agreement.status !== 'Pending approval') throw new AppError(409, 'INVALID_TRANSITION', 'Only work orders pending approval can be rejected.')
   agreement.status = 'Rejected'
+  markDocumentStale(agreement)
   agreement.rejectedAt = new Date()
   agreement.rejectionReason = reason
   await agreement.save()
@@ -1212,6 +1271,7 @@ export async function submitAgreement(id, req) {
   if (!hasPermission(req.user, 'agreements.approve')) throw new AppError(403, 'FORBIDDEN', 'You cannot submit this work order for approval.')
   if (agreement.status !== 'Draft') throw new AppError(409, 'INVALID_TRANSITION', 'Only draft work orders can be submitted.')
   agreement.status = 'Pending approval'
+  markDocumentStale(agreement)
   await agreement.save()
   await recordAudit(req, 'agreements.submitted', 'agreements', agreement.id, { status: agreement.status })
   const clientUser = await User.findOne({ clientId: agreement.clientId, role: 'client', status: 'Active' })
@@ -1232,6 +1292,7 @@ export async function issueInvoice(id, req) {
   invoice.status = 'Issued'
   invoice.issuedAt = new Date()
   invoice.balance = toMoney(Math.max(0, invoice.total - invoice.amountPaid))
+  markDocumentStale(invoice)
   await invoice.save()
   await recordAudit(req, 'invoices.issued', 'invoices', invoice.id, { status: invoice.status })
   const clientUser = await User.findOne({ clientId: invoice.clientId, role: 'client', status: 'Active' })
@@ -1331,6 +1392,7 @@ export async function refundPayment(id, body, req) {
         invoice.amountPaid = paid
         invoice.balance = toMoney(Math.max(0, invoice.total - paid))
         invoice.status = paid >= invoice.total ? 'Paid' : paid > 0 ? 'Partially Paid' : (invoice.dueDate < new Date() ? 'Overdue' : 'Issued')
+        markDocumentStale(invoice)
         await invoice.save({ session })
       }
       await recordAudit(req, 'payments.refunded', 'payments', id, { reason: body.reason }, session)

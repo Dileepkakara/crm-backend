@@ -8,6 +8,9 @@ const schema = z.object({
   JWT_SECRET: z.string().min(32),
   JWT_EXPIRES_IN: z.string().default('15m'),
   FRONTEND_URL: z.string().min(1),
+  CLOUDINARY_CLOUD_NAME: z.string().trim().optional(),
+  CLOUDINARY_API_KEY: z.string().trim().optional(),
+  CLOUDINARY_API_SECRET: z.string().trim().optional(),
   SEED_ADMIN_NAME: z.preprocess(
     (value) => (value === '' ? undefined : value),
     z.string().trim().min(1).max(120).optional(),

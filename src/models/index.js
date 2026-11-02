@@ -11,6 +11,16 @@ const transformDocument = (_doc, ret) => {
   delete ret.tokenVersion
   delete ret.idempotencyKey
   delete ret.idempotencyFingerprint
+  for (const field of ['documentVersions', 'attachments']) {
+    if (Array.isArray(ret[field])) {
+      ret[field] = ret[field].map((asset) => {
+        const metadata = { ...asset }
+        delete metadata.cloudinaryUrl
+        delete metadata.cloudinaryPublicId
+        return metadata
+      })
+    }
+  }
   for (const [key, value] of Object.entries(ret)) {
     if (value instanceof Date && (key.toLowerCase().includes('date') || ['since', 'followUp'].includes(key))) {
       ret[key] = value.toISOString().slice(0, 10)
@@ -24,6 +34,25 @@ const baseOptions = {
   toJSON: { transform: transformDocument },
   toObject: { transform: transformDocument },
 }
+
+const storedFileSchema = new Schema({
+  documentType: { type: String, enum: ['quotation', 'invoice', 'workOrder', 'agreement', 'attachment'], required: true },
+  parentRecordId: { type: String, required: true },
+  documentNumber: { type: String, trim: true, maxlength: 120 },
+  cloudinaryUrl: { type: String, required: true, maxlength: 2000 },
+  cloudinaryPublicId: { type: String, required: true, maxlength: 500 },
+  resourceType: { type: String, enum: ['image', 'raw'], required: true },
+  format: { type: String, required: true, maxlength: 20 },
+  mimeType: { type: String, required: true, maxlength: 120 },
+  originalFileName: { type: String, required: true, maxlength: 255 },
+  fileSize: { type: Number, required: true, min: 1 },
+  contentHash: { type: String, required: true, minlength: 64, maxlength: 64 },
+  versionNumber: { type: Number, min: 1, default: 1 },
+  isCurrentVersion: { type: Boolean, default: true },
+  generatedBy: { type: String, required: true },
+  uploadedAt: { type: Date, required: true },
+  updatedAt: { type: Date, required: true },
+}, { _id: true })
 
 const userSchema = new Schema({
   name: { type: String, required: true, trim: true, maxlength: 120 },
@@ -146,6 +175,9 @@ const definitions = {
     rejection: Schema.Types.Mixed,
     acceptance: Schema.Types.Mixed,
     acceptedSnapshot: Schema.Types.Mixed,
+    documentVersions: { type: [storedFileSchema], default: [] },
+    attachments: { type: [storedFileSchema], default: [] },
+    documentNeedsRegeneration: { type: Boolean, default: false },
   },
   Agreement: {
     id: { type: String, unique: true, index: true },
@@ -181,6 +213,9 @@ const definitions = {
     bankDetails: String,
     total: { type: Number, min: 0 },
     amount: { type: Number, min: 0 },
+    documentVersions: { type: [storedFileSchema], default: [] },
+    attachments: { type: [storedFileSchema], default: [] },
+    documentNeedsRegeneration: { type: Boolean, default: false },
   },
   Invoice: {
     id: { type: String, unique: true, index: true },
@@ -229,6 +264,9 @@ const definitions = {
     companyAddress: String,
     bankDetails: String,
     issuedAt: Date,
+    documentVersions: { type: [storedFileSchema], default: [] },
+    attachments: { type: [storedFileSchema], default: [] },
+    documentNeedsRegeneration: { type: Boolean, default: false },
   },
   Payment: {
     id: { type: String, unique: true, index: true },

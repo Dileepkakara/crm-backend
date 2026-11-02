@@ -6,6 +6,7 @@ import { authorize } from '../middleware/authorize.js'
 import { validate } from '../middleware/validate.js'
 import { resourcePermissions } from '../services/resources.js'
 import { invoiceDecisionSchema, resourceSchemas } from '../validation/resourceSchemas.js'
+import { attachmentUpload, documentUpload } from '../middleware/fileUpload.js'
 
 const idSchema = z.object({ id: z.string().trim().min(1).max(120) })
 const agreementIdSchema = z.object({ agreementId: z.string().trim().min(1).max(120) })
@@ -34,12 +35,6 @@ export function resourceRouter(resource) {
     router.post('/:id/convert', authorize('leads.update'), validate({ params: idSchema }), controller.convertLeadRoute)
     router.post('/:id/activities', authorize('leads.update', 'followups.create'), validate({ params: idSchema, body: activitySchema }), controller.addLeadActivityRoute)
   }
-  if (resource === 'quotations') {
-    router.post('/:id/:action', validate({
-      params: z.object({ id: z.string().trim().min(1).max(120), action: z.enum(['send', 'approve', 'reject', 'revise']) }),
-      body: z.union([reviseSchema, z.object({}).optional()]).optional(),
-    }), controller.quotationActionRoute)
-  }
   if (resource === 'agreements') {
     router.post('/:id/accept', authorize('agreements.view.own', 'agreements.approve'), validate({ params: idSchema }), controller.acceptAgreementRoute)
     router.post('/:id/reject', authorize('agreements.view.own', 'agreements.approve'), validate({ params: idSchema, body: agreementRejectSchema }), controller.rejectAgreementRoute)
@@ -48,6 +43,39 @@ export function resourceRouter(resource) {
   if (resource === 'invoices') {
     router.post('/:id/decision', validate({ params: idSchema, body: invoiceDecisionSchema }), controller.invoiceDecisionRoute)
     router.post('/:id/issue', authorize('invoices.manage'), validate({ params: idSchema }), controller.issueInvoiceRoute)
+  }
+  if (['quotations', 'invoices', 'agreements'].includes(resource)) {
+    const uploadPermissions = {
+      quotations: ['quotations.create'],
+      invoices: ['invoices.manage'],
+      agreements: ['agreements.approve'],
+    }[resource]
+    router.post('/:id/documents', authorize(...uploadPermissions), validate({ params: idSchema }), documentUpload, controller.uploadDocument(resource))
+    router.post('/:id/attachments', authorize(...uploadPermissions), validate({ params: idSchema }), attachmentUpload, controller.uploadAttachment(resource))
+    router.delete('/:id/documents/:version', authorize(...uploadPermissions), validate({
+      params: z.object({
+        id: z.string().trim().min(1).max(120),
+        version: z.string().regex(/^[1-9]\d*$/),
+      }),
+    }), controller.deleteDocumentVersionRoute(resource))
+    router.get('/:id/documents/:version', authorize(...permissions.read), validate({
+      params: z.object({
+        id: z.string().trim().min(1).max(120),
+        version: z.union([z.literal('current'), z.string().regex(/^[1-9]\d*$/)]),
+      }),
+    }), controller.getDocument(resource))
+    router.get('/:id/attachments/:attachmentId', authorize(...permissions.read), validate({
+      params: z.object({
+        id: z.string().trim().min(1).max(120),
+        attachmentId: z.string().trim().min(1).max(120),
+      }),
+    }), controller.getAttachment(resource))
+  }
+  if (resource === 'quotations') {
+    router.post('/:id/:action', validate({
+      params: z.object({ id: z.string().trim().min(1).max(120), action: z.enum(['send', 'approve', 'reject', 'revise']) }),
+      body: z.union([reviseSchema, z.object({}).optional()]).optional(),
+    }), controller.quotationActionRoute)
   }
   if (resource === 'payments') {
     router.post('/:id/refund', authorize('payments.manage'), validate({ params: idSchema, body: refundSchema }), controller.refundPaymentRoute)

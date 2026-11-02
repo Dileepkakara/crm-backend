@@ -22,6 +22,13 @@ import {
 import { Agreement, Project, Notification } from '../models/index.js'
 import { hasPermission } from '../middleware/authorize.js'
 import { recordAudit } from '../services/audit.js'
+import {
+  deleteDocumentVersion,
+  retrieveAttachment,
+  retrieveDocument,
+  saveAttachment,
+  saveGeneratedDocument,
+} from '../services/documents.js'
 
 export function list(resource) {
   return asyncRoute(async (req, res) => {
@@ -59,6 +66,56 @@ export function remove(resource) {
   return asyncRoute(async (req, res) => {
     success(res, await deleteResource(resource, req.params.id, req))
   })
+}
+
+export function uploadDocument(resource) {
+  return asyncRoute(async (req, res) => {
+    success(res, await saveGeneratedDocument(resource, req.params.id, req.file, req), 201)
+  })
+}
+
+export function uploadAttachment(resource) {
+  return asyncRoute(async (req, res) => {
+    success(res, await saveAttachment(resource, req.params.id, req.file, req), 201)
+  })
+}
+
+export function deleteDocumentVersionRoute(resource) {
+  return asyncRoute(async (req, res) => {
+    success(res, await deleteDocumentVersion(resource, req.params.id, req.params.version, req))
+  })
+}
+
+export function getDocument(resource) {
+  return asyncRoute(async (req, res) => {
+    const download = req.query.download === 'true'
+    const file = await retrieveDocument(resource, req.params.id, req.params.version, req.user, download)
+    await recordAudit(req, `${resource}.document_${download ? 'downloaded' : 'viewed'}`, resource, req.params.id, {
+      versionNumber: file.versionNumber,
+    })
+    sendPrivateFile(res, file)
+  })
+}
+
+export function getAttachment(resource) {
+  return asyncRoute(async (req, res) => {
+    const download = req.query.download === 'true'
+    const file = await retrieveAttachment(resource, req.params.id, req.params.attachmentId, req.user, download)
+    await recordAudit(req, `${resource}.attachment_${download ? 'downloaded' : 'viewed'}`, resource, req.params.id, {
+      attachmentId: req.params.attachmentId,
+    })
+    sendPrivateFile(res, file)
+  })
+}
+
+function sendPrivateFile(res, file) {
+  res.set({
+    'Cache-Control': 'private, no-store',
+    'Content-Length': String(file.buffer.length),
+    'Content-Disposition': `${file.download ? 'attachment' : 'inline'}; filename*=UTF-8''${encodeURIComponent(file.originalFileName)}`,
+    'X-Content-Type-Options': 'nosniff',
+  })
+  res.type(file.mimeType).send(file.buffer)
 }
 
 export const convertLeadRoute = asyncRoute(async (req, res) => {

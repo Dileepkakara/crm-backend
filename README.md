@@ -63,6 +63,18 @@ After seeding, sign in through the frontend login page with the configured Super
 
 The sign-in page provides separate **Team workspace** and **Client portal** options. Clients may submit a portal access request at `/client-signup`; submission does not grant access. Super Admins review requests in **Client requests**, link a matching existing Client record or create one, and approve or reject requests. Approval creates a Client-only account and returns a random temporary password once to the authorized administrator; deliver it through a trusted channel. The client signs in at `/client-login` and must change the temporary password before accessing the portal. There is no email/SMS provider configured, and temporary passwords are never stored in plaintext. Client-only login rejects staff accounts and requires an active linked Client record.
 
+## Quotation, invoice, and work-order documents
+
+The existing React document template is rendered to PDF in the browser and uploaded to the backend; the backend stores authenticated Cloudinary assets and embeds version metadata in the existing quotation, invoice, or agreement record. Configure these backend-only environment variable names to enable storage:
+
+- `CLOUDINARY_CLOUD_NAME`
+- `CLOUDINARY_API_KEY`
+- `CLOUDINARY_API_SECRET`
+
+If any are unset, the API reports the missing names when an upload is attempted. Never add these values to frontend environment variables. Configure Cloudinary authenticated delivery for the account so files are not publicly accessible. Final PDFs are limited to 15 MB; supporting PDF, JPEG, PNG, and WebP files are also limited to 15 MB. The backend validates declared media type, extension, and file signature.
+
+Uploads require the existing resource permissions and MongoDB transaction support. The API records document versions and audit events on the parent record, attempts Cloudinary cleanup if persistence fails, and serves files only after checking the caller's access to that record. Clients receive only their own published records and current document version; internal Cloudinary URLs and public IDs are not returned. Editing document-relevant fields, related client contact details, or printable company settings marks saved PDFs as requiring regeneration. Reprinting/downloading a saved PDF does not create another version.
+
 ## Authentication and response contract
 
 Login returns a short-lived bearer access token and sets a rotating, HTTP-only refresh cookie. Keep the access token in memory; the frontend refreshes the cookie-backed session after a page reload. In production, the refresh cookie uses `SameSite=None; Secure` because the Vercel frontend and Render API are on different sites; browsers must allow cross-site cookies for session restoration. Logout and password changes revoke the stored refresh token and invalidate current access tokens. Configure HTTPS in production. Password changes require the current password; there is no password recovery email provider configured.
